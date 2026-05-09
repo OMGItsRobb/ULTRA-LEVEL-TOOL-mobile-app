@@ -2,6 +2,9 @@
 
 Ultra Level Tool is a mobile level and inclinometer built with Expo and React Native for iOS and Android. It uses device motion sensors to provide live leveling feedback, a flat-surface bubble interface, edge measurements, saved readings, and built-in rulers for quick reference on a phone.
 
+<img width="2004" height="878" alt="image" src="https://github.com/user-attachments/assets/cda822d7-807a-4cd0-a30f-514cc092a788" />
+
+
 # Disclosure
 
 This app was updated from Expo v44 to v54, and may not work exactly as intended on v54
