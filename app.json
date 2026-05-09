@@ -1,12 +1,12 @@
 {
   "expo": {
-    "name": "UltraLevel",
-    "slug": "UltraLevel",
+    "name": "Ultra Level Tool",
+    "slug": "ultra-level-tool",
     "version": "1.0.0",
-    "orientation": "portrait",
+    "orientation": "default",
     "icon": "./assets/images/icon.png",
-    "scheme": "ultralevel",
-    "userInterfaceStyle": "automatic",
+    "scheme": "ultra-level-tool",
+    "userInterfaceStyle": "dark",
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": true
@@ -28,6 +28,14 @@
     "plugins": [
       "expo-router",
       [
+        "expo-font",
+        {
+          "fonts": [
+            "./node_modules/@expo/vector-icons/build/vendor/react-native-vector-icons/Fonts/MaterialCommunityIcons.ttf"
+          ]
+        }
+      ],
+      [
         "expo-splash-screen",
         {
           "image": "./assets/images/splash-icon.png",
@@ -38,7 +46,8 @@
             "backgroundColor": "#000000"
           }
         }
-      ]
+      ],
+      "expo-audio"
     ],
     "experiments": {
       "typedRoutes": true,
