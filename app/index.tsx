@@ -63,6 +63,10 @@ const LEVEL_TOLERANCE_DEGREES = 2;
 const STABLE_TOLERANCE_DEGREES = 2;
 // Run device-motion updates fast enough for smooth UI feedback.
 const SENSOR_INTERVAL_MS = 25;
+// Target time constant for the gravity low-pass filter. Using a fixed tau and computing alpha
+// from the actual elapsed time between samples keeps the filter stable on Android, where the
+// OS only treats setUpdateInterval as a hint and may deliver events at irregular intervals.
+const SENSOR_SMOOTH_TAU_MS = 100;
 // Limit bubble travel so the gauge remains readable at steeper angles.
 const BUBBLE_LIMIT_DEGREES = 12;
 // Quantize degree-based readouts to full-degree steps.
@@ -120,16 +124,24 @@ function normalize(measurement: Pick<Vector, 'x' | 'y' | 'z'>): Vector {
   };
 }
 
-/** Blend the previous vector with the newest one to reduce sensor jitter. */
-function mixVectors(previous: Vector | null, next: Vector) {
+/** Blend the previous vector with the newest one to reduce sensor jitter.
+ *
+ * `dt` is the milliseconds elapsed since the last sample. Using the actual dt
+ * instead of a hardcoded weight keeps the effective time-constant consistent on
+ * Android, where the OS delivers sensor events at irregular intervals even when
+ * a specific rate is requested.
+ */
+function mixVectors(previous: Vector | null, next: Vector, dt: number = SENSOR_INTERVAL_MS) {
   if (!previous) {
     return next;
   }
 
+  const alpha = 1 - Math.exp(-dt / SENSOR_SMOOTH_TAU_MS);
+
   return normalize({
-    x: previous.x * 0.72 + next.x * 0.28,
-    y: previous.y * 0.72 + next.y * 0.28,
-    z: previous.z * 0.72 + next.z * 0.28,
+    x: previous.x * (1 - alpha) + next.x * alpha,
+    y: previous.y * (1 - alpha) + next.y * alpha,
+    z: previous.z * (1 - alpha) + next.z * alpha,
   });
 }
 
@@ -584,6 +596,8 @@ export default function HomeScreen() {
   const rulerOffsetRef = useRef(0);
   // Keep the headline angle snapped at zero while it hovers around level.
   const zeroSnappedRef = useRef(false);
+  // Timestamp of the most recent gravity sensor sample, used to compute dt for the EMA filter.
+  const lastSensorTimeRef = useRef<number | null>(null);
   // Track the current stable reading window before auto-capturing it into history.
   const stableRef = useRef<{
     angle: number;
@@ -899,7 +913,10 @@ export default function HomeScreen() {
         }
 
         const nextVector = normalize(gravity);
-        setVector((current) => mixVectors(current, nextVector));
+        const now = Date.now();
+        const dt = lastSensorTimeRef.current !== null ? now - lastSensorTimeRef.current : SENSOR_INTERVAL_MS;
+        lastSensorTimeRef.current = now;
+        setVector((current) => mixVectors(current, nextVector, dt));
         setSensorStatus('Live');
       });
     }
@@ -909,6 +926,7 @@ export default function HomeScreen() {
     return () => {
       mounted = false;
       subscription?.remove();
+      lastSensorTimeRef.current = null;
     };
   }, []);
 
