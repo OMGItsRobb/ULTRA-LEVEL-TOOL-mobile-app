@@ -62,7 +62,7 @@ const LEVEL_TOLERANCE_DEGREES = 2;
 // A history capture only counts as stable if the angle stays within this delta.
 const STABLE_TOLERANCE_DEGREES = 2;
 // Run device-motion updates fast enough for smooth UI feedback.
-const SENSOR_INTERVAL_MS = 50;
+const SENSOR_INTERVAL_MS = 35;
 // Target time constant for the gravity low-pass filter. Using a fixed tau and computing alpha
 // from the actual elapsed time between samples keeps the filter stable on Android, where the
 // OS only treats setUpdateInterval as a hint and may deliver events at irregular intervals.
