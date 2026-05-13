@@ -3,14 +3,14 @@
     "name": "Ultra Level Tool",
     "slug": "ultra-level-tool",
     "version": "1.0.0",
-    "orientation": "default",
+    "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "ultra-level-tool",
     "userInterfaceStyle": "dark",
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "",
+      "bundleIdentifier": "com.ntronowicz.ultraleveltool",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
       }
@@ -28,7 +28,7 @@
         "android.permission.RECORD_AUDIO",
         "android.permission.MODIFY_AUDIO_SETTINGS"
       ],
-      "package": ""
+      "package": "com.ntronowicz.ultraleveltool"
     },
     "web": {
       "output": "static",

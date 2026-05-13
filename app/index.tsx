@@ -2,11 +2,18 @@ import { MaterialCommunityIcons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useAudioPlayer, type AudioPlayer } from 'expo-audio';
 import * as Haptics from 'expo-haptics';
-import * as ScreenOrientation from 'expo-screen-orientation';
-import { DeviceMotion, type DeviceMotionMeasurement } from 'expo-sensors';
+import { useKeepAwake } from 'expo-keep-awake';
+import {
+  DeviceMotion,
+  DeviceMotionOrientation,
+  Magnetometer,
+  type DeviceMotionMeasurement,
+  type MagnetometerMeasurement,
+} from 'expo-sensors';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Animated,
+  Easing,
   Modal,
   PanResponder,
   Pressable,
@@ -19,9 +26,8 @@ import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 
 type Unit = 'degrees' | 'riseRun' | 'percent';
 type TargetMode = 'auto' | 'flat' | 'edge';
-type Axis = 'x' | 'y' | 'z';
 type RulerUnit = 'cm' | 'in';
-type RulerPlacement = 'left' | 'right' | 'top' | 'bottom';
+type RulerPlacement = 'left' | 'right';
 
 type Vector = {
   x: number;
@@ -36,7 +42,6 @@ type FlatAngles = {
 
 type Reading = {
   angle: number;
-  axis: Axis;
   flatAngles: FlatAngles | null;
   mode: Exclude<TargetMode, 'auto'>;
   oneAxis: boolean;
@@ -46,7 +51,6 @@ type Reading = {
     x: number;
     y: number;
   };
-  vector: Vector;
 };
 
 type HistoryItem = {
@@ -62,7 +66,7 @@ const LEVEL_TOLERANCE_DEGREES = 2;
 // A history capture only counts as stable if the angle stays within this delta.
 const STABLE_TOLERANCE_DEGREES = 2;
 // Run device-motion updates fast enough for smooth UI feedback.
-const SENSOR_INTERVAL_MS = 35;
+const SENSOR_INTERVAL_MS = 25;
 // Target time constant for the gravity low-pass filter. Using a fixed tau and computing alpha
 // from the actual elapsed time between samples keeps the filter stable on Android, where the
 // OS only treats setUpdateInterval as a hint and may deliver events at irregular intervals.
@@ -77,18 +81,66 @@ const ROLL_SNAP_DEGREES = 0.5;
 const ROLL_RELEASE_DEGREES = 0.35;
 // Clamp the roll-based color interpolation to a useful visual range.
 const ROLL_COLOR_MAX_DEGREES = 12;
+// Snap edge UI into its sideways orientation once the phone passes this roll angle.
+const EDGE_ROTATION_ENTER_DEGREES = 45;
+// Release the sideways orientation only after the phone moves clearly back toward portrait.
+const EDGE_ROTATION_EXIT_DEGREES = 35;
+// Keep edge UI readable if the device is nearly upside down.
+const EDGE_UPSIDE_DOWN_ENTER_DEGREES = 135;
+const EDGE_UPSIDE_DOWN_EXIT_DEGREES = 125;
+// Edge orientation changes should feel immediate rather than laggy.
+const EDGE_ROTATION_ANIMATION_MS = 110;
 // Persist captured history under a stable app-scoped key.
 const HISTORY_STORAGE_KEY = 'ultra-level-tool/history';
 // Keep only the most recent captured readings.
 const MAX_HISTORY_ITEMS = 50;
 // Enforce a global cooldown between level dings so wobble cannot spam feedback.
 const LEVEL_DING_COOLDOWN_MS = 4000;
+// Magnetometer update interval — heading needs less precision than gravity.
+const MAGNETOMETER_INTERVAL_MS = 25;
+// Blend factor for the heading EMA. Lower = smoother but laggier.
+const HEADING_SMOOTH_ALPHA = 0.18;
+// Blend factor for the per-sample jitter EMA used to estimate confidence.
+const CONFIDENCE_JITTER_ALPHA = 0.12;
+// Jitter magnitude at or above which the reading is treated as 0% confidence.
+const CONFIDENCE_JITTER_LIMIT = 0.05;
+// Throttle confidence state updates so we don't re-render on every sensor sample.
+const CONFIDENCE_UPDATE_INTERVAL_MS = 150;
+// Pixel diameter of the compass ring rendered around the flat-mode center ring.
+// Sized at runtime relative to the gauge; clamped between these bounds.
+const COMPASS_RING_MIN_DIAMETER = 136;
+const COMPASS_RING_MAX_DIAMETER = 184;
+// Inset of the cardinal letters from the compass ring's outer edge (in pixels).
+const COMPASS_LABEL_INSET = 24;
+// Inset of the tick marks from the compass ring's outer edge (in pixels).
+const COMPASS_TICK_INSET = 6;
+// Tick marks every 30°, with cardinal directions highlighted.
+const COMPASS_TICKS: { deg: number; cardinal: boolean }[] = [
+  { deg: 0, cardinal: true },
+  { deg: 30, cardinal: false },
+  { deg: 60, cardinal: false },
+  { deg: 90, cardinal: true },
+  { deg: 120, cardinal: false },
+  { deg: 150, cardinal: false },
+  { deg: 180, cardinal: true },
+  { deg: 210, cardinal: false },
+  { deg: 240, cardinal: false },
+  { deg: 270, cardinal: true },
+  { deg: 300, cardinal: false },
+  { deg: 330, cardinal: false },
+];
+// Cardinal letters placed inside the ring so they rotate with the compass face.
+const COMPASS_LABELS: { deg: number; text: string }[] = [
+  { deg: 0, text: 'N' },
+  { deg: 90, text: 'E' },
+  { deg: 180, text: 'S' },
+  { deg: 270, text: 'W' },
+];
 const RULER_WIDTH = 44;
 const RULER_GAP = 12;
 const DP_PER_INCH = 160;
 const DP_PER_CM = DP_PER_INCH / 2.54;
 const RULER_HANDLE_HEIGHT = 34;
-const RULER_HANDLE_WIDTH = 54;
 const RULER_LABEL_WIDTH = 28;
 
 const UNITS: { value: Unit; label: string }[] = [
@@ -107,6 +159,15 @@ const MODE_LABELS: Record<Reading['mode'], string> = {
   flat: 'Flat',
   edge: 'Edge',
 };
+
+const FLAT_AXIS_DIRECTIONS: {
+  icon: keyof typeof MaterialCommunityIcons.glyphMap;
+  key: keyof FlatAngles;
+  label: string;
+}[] = [
+    { icon: 'arrow-left-right-bold', key: 'x', label: 'Left to right' },
+    { icon: 'arrow-up-down-bold', key: 'y', label: 'Up and down' },
+  ];
 
 /** Clamp a numeric value into an inclusive range. */
 function clamp(value: number, min: number, max: number) {
@@ -175,37 +236,138 @@ function mixColor(start: string, end: string, amount: number) {
   return `rgb(${red}, ${green}, ${blue})`;
 }
 
-/** Map the current screen orientation to the axes the UI considers right and up. */
-function getUiAxes(orientation: ScreenOrientation.Orientation) {
-  if (orientation === ScreenOrientation.Orientation.PORTRAIT_DOWN) {
-    return {
-      right: { x: -1, y: 0, z: 0 },
-      up: { x: 0, y: -1, z: 0 },
-    };
+/** Compute compass heading (0..360, CW from magnetic north) for a phone resting flat. */
+function magnetometerHeading(x: number, y: number) {
+  const raw = Math.atan2(-x, y) * (180 / Math.PI);
+
+  return (raw + 360) % 360;
+}
+
+/** Blend two heading values across the 0/360 boundary to avoid flip jitter. */
+function smoothHeading(previous: number | null, next: number, alpha: number) {
+  if (previous === null) {
+    return next;
   }
 
-  if (orientation === ScreenOrientation.Orientation.LANDSCAPE_LEFT) {
-    return {
-      right: { x: 0, y: 1, z: 0 },
-      up: { x: -1, y: 0, z: 0 },
-    };
+  let delta = next - previous;
+
+  if (delta > 180) {
+    delta -= 360;
+  } else if (delta < -180) {
+    delta += 360;
   }
 
-  if (orientation === ScreenOrientation.Orientation.LANDSCAPE_RIGHT) {
-    return {
-      right: { x: 0, y: -1, z: 0 },
-      up: { x: 1, y: 0, z: 0 },
-    };
+  return (previous + delta * alpha + 360) % 360;
+}
+
+/** Bucket a 0..1 confidence value into a labeled tier for UI display. */
+function confidenceTier(value: number) {
+  if (value >= 0.7) {
+    return { bars: 3, label: 'High', color: '#5BE3A4' };
   }
+
+  if (value >= 0.4) {
+    return { bars: 2, label: 'Medium', color: '#E3D45B' };
+  }
+
+  if (value > 0.05) {
+    return { bars: 1, label: 'Low', color: '#E37A5B' };
+  }
+
+  return { bars: 0, label: 'Very low', color: '#E35B5B' };
+}
+
+/** Map the current device orientation to the axes the UI considers right and up. */
+function getUiAxes(orientation: DeviceMotionOrientation) {
+  const radians = (-orientation * Math.PI) / 180;
+  const cos = Math.round(Math.cos(radians));
+  const sin = Math.round(Math.sin(radians));
 
   return {
-    right: { x: 1, y: 0, z: 0 },
-    up: { x: 0, y: 1, z: 0 },
+    right: { x: cos, y: sin, z: 0 },
+    up: { x: -sin, y: cos, z: 0 },
   };
 }
 
+/** Normalize an angle into the inclusive [-180, 180] range for UI rotation decisions. */
+function normalizeSignedAngle(angle: number) {
+  const normalized = ((angle + 180) % 360 + 360) % 360 - 180;
+
+  return normalized === -180 ? 180 : normalized;
+}
+
+/** Snap edge UI to stable portrait/sideways quadrants with hysteresis near the thresholds. */
+function getEdgeRotationTarget(angle: number, currentRotation: number) {
+  const normalized = normalizeSignedAngle(angle);
+
+  if (currentRotation === -90) {
+    if (normalized >= EDGE_UPSIDE_DOWN_ENTER_DEGREES) {
+      return 180;
+    }
+
+    if (normalized <= EDGE_ROTATION_EXIT_DEGREES) {
+      return 0;
+    }
+
+    return -90;
+  }
+
+  if (currentRotation === 90) {
+    if (normalized <= -EDGE_UPSIDE_DOWN_ENTER_DEGREES) {
+      return 180;
+    }
+
+    if (normalized >= -EDGE_ROTATION_EXIT_DEGREES) {
+      return 0;
+    }
+
+    return 90;
+  }
+
+  if (currentRotation === 180) {
+    if (normalized >= 0 && normalized < EDGE_UPSIDE_DOWN_EXIT_DEGREES) {
+      return -90;
+    }
+
+    if (normalized < 0 && normalized > -EDGE_UPSIDE_DOWN_EXIT_DEGREES) {
+      return 90;
+    }
+
+    return 180;
+  }
+
+  if (normalized >= EDGE_UPSIDE_DOWN_ENTER_DEGREES || normalized <= -EDGE_UPSIDE_DOWN_ENTER_DEGREES) {
+    return 180;
+  }
+
+  if (normalized >= EDGE_ROTATION_ENTER_DEGREES) {
+    return -90;
+  }
+
+  if (normalized <= -EDGE_ROTATION_ENTER_DEGREES) {
+    return 90;
+  }
+
+  return 0;
+}
+
+/** Choose the closest equivalent target angle so the edge UI never spins the long way around. */
+function getClosestRotationTarget(target: number, current: number) {
+  let adjusted = target;
+
+  while (adjusted - current > 180) {
+    adjusted -= 360;
+  }
+
+  while (adjusted - current < -180) {
+    adjusted += 360;
+  }
+
+  return adjusted;
+}
+
 /** Convert the current gravity vector into a roll angle for the active UI orientation. */
-function getRollFromVector(vector: Vector, orientation: ScreenOrientation.Orientation) {
+function getRollFromVector(vector: Vector, orientation: DeviceMotionOrientation) {
   const { right, up } = getUiAxes(orientation);
   const gravityRight = dot(vector, right);
   const gravityUp = dot(vector, up);
@@ -225,7 +387,7 @@ function getRollFromVector(vector: Vector, orientation: ScreenOrientation.Orient
 function readingFromVector(
   vector: Vector,
   selectedMode: TargetMode,
-  orientation: ScreenOrientation.Orientation
+  orientation: DeviceMotionOrientation
 ): Reading {
   const { right, up } = getUiAxes(orientation);
   const gravityRight = dot(vector, right);
@@ -235,7 +397,6 @@ function readingFromVector(
   const flatReference = Math.abs(gravityOut);
   const useFlat = selectedMode === 'flat' || (selectedMode === 'auto' && Math.abs(gravityOut) > 0.72);
   const mode: Reading['mode'] = useFlat ? 'flat' : 'edge';
-  const axis: Axis = useFlat ? 'z' : Math.abs(up.x) > 0 ? 'x' : 'y';
   const flatX = Math.atan2(gravityRight, flatReference) * (180 / Math.PI);
   const flatY = Math.atan2(gravityUp, flatReference) * (180 / Math.PI);
   const flatAngle = Math.atan2(
@@ -250,7 +411,6 @@ function readingFromVector(
     : null;
   const flatSignedAngle = Math.abs(flatX) >= Math.abs(flatY) ? -flatX : -flatY;
   const edgeSignedAngle = rollAngle;
-  const edgeAngle = Math.abs(edgeSignedAngle);
   const signedAngle = useFlat ? flatSignedAngle : edgeSignedAngle;
   const angle = Math.abs(signedAngle);
   const bubbleLimit = Math.sin(BUBBLE_LIMIT_DEGREES * (Math.PI / 180));
@@ -266,14 +426,12 @@ function readingFromVector(
 
   return {
     angle: useFlat ? flatAngle : angle,
-    axis,
     flatAngles,
     mode,
     oneAxis: !useFlat,
     rollAngle,
     signedAngle,
     bubble,
-    vector,
   };
 }
 
@@ -372,90 +530,64 @@ function SideRuler({
   length,
   placement,
   unit,
+  insets,
 }: {
   offset?: Animated.Value | number;
   length: number;
   placement: RulerPlacement;
   unit: RulerUnit;
+  insets: { top: number; bottom: number; left: number; right: number };
 }) {
   const marks = useMemo(() => buildRulerMarks(length, unit), [length, unit]);
-  const isVertical = placement === 'left' || placement === 'right';
+  const positionStyle = {
+    top: insets.top,
+    bottom: insets.bottom,
+    ...(placement === 'left'
+      ? { left: insets.left + 6 }
+      : { right: insets.right + 6 }),
+  };
 
   return (
     <View
       pointerEvents="none"
       style={[
         styles.ruler,
-        isVertical ? styles.rulerVertical : styles.rulerHorizontal,
-        placement === 'left'
-          ? styles.rulerLeft
-          : placement === 'right'
-            ? styles.rulerRight
-            : placement === 'top'
-              ? styles.rulerTop
-              : styles.rulerBottom,
+        styles.rulerVertical,
+        positionStyle,
       ]}>
       <View
         style={[
           styles.rulerEdge,
-          placement === 'left'
-            ? styles.rulerEdgeLeft
-            : placement === 'right'
-              ? styles.rulerEdgeRight
-              : placement === 'top'
-                ? styles.rulerEdgeTop
-                : styles.rulerEdgeBottom,
+          placement === 'left' ? styles.rulerEdgeLeft : styles.rulerEdgeRight,
         ]}
       />
       <Animated.View
         style={[
           styles.rulerTrack,
-          isVertical ? styles.rulerTrackVertical : styles.rulerTrackHorizontal,
-          isVertical
-            ? { height: length, transform: [{ translateY: offset }] }
-            : { width: length, transform: [{ translateX: offset }] },
+          styles.rulerTrackVertical,
+          { height: length, transform: [{ translateY: offset }] },
         ]}>
         {marks.map((mark) => (
           <React.Fragment key={mark.id}>
             <View
               style={[
                 styles.rulerTick,
-                isVertical ? styles.rulerTickVertical : styles.rulerTickHorizontal,
-                isVertical
-                  ? mark.size === 'long'
-                    ? styles.rulerTickLong
-                    : mark.size === 'medium'
-                      ? styles.rulerTickMedium
-                      : styles.rulerTickShort
-                  : mark.size === 'long'
-                    ? styles.rulerTickLongHorizontal
-                    : mark.size === 'medium'
-                      ? styles.rulerTickMediumHorizontal
-                      : styles.rulerTickShortHorizontal,
-                placement === 'left'
-                  ? styles.rulerTickLeft
-                  : placement === 'right'
-                    ? styles.rulerTickRight
-                    : placement === 'top'
-                      ? styles.rulerTickTop
-                      : styles.rulerTickBottom,
-                isVertical ? { top: mark.top } : { left: mark.top },
+                styles.rulerTickVertical,
+                mark.size === 'long'
+                  ? styles.rulerTickLong
+                  : mark.size === 'medium'
+                    ? styles.rulerTickMedium
+                    : styles.rulerTickShort,
+                placement === 'left' ? styles.rulerTickLeft : styles.rulerTickRight,
+                { top: mark.top },
               ]}
             />
             {mark.label ? (
               <Text
                 style={[
                   styles.rulerLabel,
-                  placement === 'left'
-                    ? styles.rulerLabelLeft
-                    : placement === 'right'
-                      ? styles.rulerLabelRight
-                      : placement === 'top'
-                        ? styles.rulerLabelTop
-                        : styles.rulerLabelBottom,
-                  isVertical
-                    ? { top: Math.max(0, mark.top - 7) }
-                    : { left: Math.max(0, mark.top - RULER_LABEL_WIDTH / 2) },
+                  placement === 'left' ? styles.rulerLabelLeft : styles.rulerLabelRight,
+                  { top: Math.max(0, mark.top - 7) },
                 ]}>
                 {mark.label}
               </Text>
@@ -466,13 +598,7 @@ function SideRuler({
       <View
         style={[
           styles.rulerUnitBadge,
-          placement === 'left'
-            ? styles.rulerUnitBadgeLeft
-            : placement === 'right'
-              ? styles.rulerUnitBadgeRight
-              : placement === 'top'
-                ? styles.rulerUnitBadgeTop
-                : styles.rulerUnitBadgeBottom,
+          placement === 'left' ? styles.rulerUnitBadgeLeft : styles.rulerUnitBadgeRight,
         ]}>
         <Text style={styles.rulerUnitText}>{unit}</Text>
       </View>
@@ -532,9 +658,45 @@ function formatSecondary(angle: number, unit: Unit) {
   return `${rise > 0 ? '+' : ''}${rise}/12 rise`;
 }
 
-/** Format both flat-mode axes using the active unit so they can be shown together. */
-function formatFlatAxisSummary(flatAngles: FlatAngles, unit: Unit) {
-  return `X ${formatPrimary(flatAngles.x, unit)} · Y ${formatPrimary(flatAngles.y, unit)}`;
+/** Render the flat-mode axis values with directional icons instead of raw X/Y labels. */
+function FlatAxisSummary({
+  flatAngles,
+  unit,
+  variant,
+}: {
+  flatAngles: FlatAngles;
+  unit: Unit;
+  variant: 'readout' | 'history';
+}) {
+  const isHistory = variant === 'history';
+
+  return (
+    <View
+      style={[
+        styles.flatAxisSummary,
+        isHistory ? styles.flatAxisSummaryHistory : styles.flatAxisSummaryReadout,
+      ]}>
+      {FLAT_AXIS_DIRECTIONS.map((direction) => {
+        const value = formatPrimary(flatAngles[direction.key], unit);
+
+        return (
+          <View
+            accessibilityLabel={`${direction.label} slope ${value}`}
+            key={direction.key}
+            style={[styles.flatAxisRow, isHistory && styles.flatAxisRowHistory]}>
+            <View style={[styles.flatAxisIconBadge, isHistory && styles.flatAxisIconBadgeHistory]}>
+              <MaterialCommunityIcons
+                color={isHistory ? 'rgba(255, 255, 255, 0.9)' : '#FFFFFF'}
+                name={direction.icon}
+                size={isHistory ? 14 : 16}
+              />
+            </View>
+            <Text style={[styles.flatAxisValue, isHistory && styles.flatAxisValueHistory]}>{value}</Text>
+          </View>
+        );
+      })}
+    </View>
+  );
 }
 
 /** Restart and play a short UI sound if sound effects are enabled. */
@@ -545,16 +707,6 @@ function playCue(player: AudioPlayer, soundEnabled: boolean) {
 
   player.seekTo(0).catch(() => undefined);
   player.play();
-}
-
-/** Centralize orientation behavior so mode and modal transitions stay consistent. */
-async function applyOrientationLock(mode: TargetMode) {
-  if (mode === 'flat') {
-    await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT);
-    return;
-  }
-
-  await ScreenOrientation.unlockAsync();
 }
 
 /** Main level screen that renders the live gauge, rulers, controls, and history modal. */
@@ -569,9 +721,11 @@ export default function HomeScreen() {
   const [historyVisible, setHistoryVisible] = useState(false);
   const [historyIndex, setHistoryIndex] = useState(0);
   const [soundEnabled, setSoundEnabled] = useState(true);
-  const [sensorStatus, setSensorStatus] = useState('Starting sensors');
-  const [screenOrientation, setScreenOrientation] = useState(ScreenOrientation.Orientation.UNKNOWN);
-  const [lockStatus, setLockStatus] = useState('Auto target');
+  const [edgeRotationTarget, setEdgeRotationTarget] = useState(0);
+  const [heading, setHeading] = useState<number | null>(null);
+  const [confidence, setConfidence] = useState(1);
+
+  useKeepAwake();
 
   const dingPlayer = useAudioPlayer(require('@/assets/sounds/level-ding.wav'), {
     keepAudioSessionActive: true,
@@ -579,6 +733,10 @@ export default function HomeScreen() {
   const capturePlayer = useAudioPlayer(require('@/assets/sounds/level-capture.wav'), {
     keepAudioSessionActive: true,
   });
+  // Flash the history button whenever a new reading is saved.
+  const historyButtonFlash = useRef(new Animated.Value(0)).current;
+  // Animated snap rotation shared by the edge gauge and edge readout.
+  const edgeRotation = useRef(new Animated.Value(0)).current;
   // Shared ruler track offset so both rulers move together.
   const rulerOffset = useRef(new Animated.Value(0)).current;
   // Temporary handle displacement so the grabber can spring back after each drag.
@@ -598,6 +756,16 @@ export default function HomeScreen() {
   const zeroSnappedRef = useRef(false);
   // Timestamp of the most recent gravity sensor sample, used to compute dt for the EMA filter.
   const lastSensorTimeRef = useRef<number | null>(null);
+  // Smoothed magnetometer reading used to keep heading display from jittering.
+  const magVectorRef = useRef<{ x: number; y: number; z: number } | null>(null);
+  // Smoothed heading (degrees CW from magnetic north) backing the compass UI.
+  const headingRef = useRef<number | null>(null);
+  // Previous raw gravity sample, used to measure jitter for the confidence indicator.
+  const prevRawVectorRef = useRef<Vector | null>(null);
+  // EMA of per-sample gravity delta — higher value means more device movement.
+  const jitterRef = useRef(0);
+  // Throttle timestamp for confidence state updates.
+  const lastConfidenceUpdateRef = useRef(0);
   // Track the current stable reading window before auto-capturing it into history.
   const stableRef = useRef<{
     angle: number;
@@ -612,49 +780,69 @@ export default function HomeScreen() {
       return null;
     }
 
-    return readingFromVector(vector, mode, screenOrientation);
-  }, [mode, screenOrientation, vector]);
+    return readingFromVector(vector, mode, DeviceMotionOrientation.Portrait);
+  }, [mode, vector]);
 
   const bubble = useMemo(() => {
     if (!reading) {
       return { x: 0, y: 0 };
     }
 
-    return reading.bubble;
-  }, [reading]);
+    if (reading.mode === 'edge') {
+      const edgeBubbleAngle = normalizeSignedAngle(reading.rollAngle + edgeRotationTarget);
+      const bubbleLimit = Math.sin(BUBBLE_LIMIT_DEGREES * (Math.PI / 180));
 
-  const isLandscape = width > height;
-  const baseHorizontalPadding = isLandscape ? 14 : 20;
-  const baseTopPadding = isLandscape ? 6 : 12;
-  const baseBottomPadding = isLandscape ? 10 : 16;
-  const contentHorizontalPadding = baseHorizontalPadding + (isLandscape ? 0 : RULER_WIDTH + RULER_GAP);
-  const contentTopPadding = baseTopPadding + (isLandscape ? RULER_WIDTH + RULER_GAP : 0);
-  const contentBottomPadding = baseBottomPadding + (isLandscape ? RULER_WIDTH + RULER_GAP : 0);
+      return {
+        x: clamp(-Math.sin(edgeBubbleAngle * (Math.PI / 180)) / bubbleLimit, -1, 1),
+        y: 0,
+      };
+    }
+
+    return reading.bubble;
+  }, [edgeRotationTarget, reading]);
+
+  const baseHorizontalPadding = 20;
+  const baseTopPadding = 12;
+  const baseBottomPadding = 16;
+  const contentHorizontalPadding = baseHorizontalPadding + RULER_WIDTH + RULER_GAP;
+  const contentTopPadding = baseTopPadding;
+  const contentBottomPadding = baseBottomPadding;
   const availableContentWidth = width - insets.left - insets.right - contentHorizontalPadding * 2;
   const availableContentHeight = height - insets.top - insets.bottom - contentTopPadding - contentBottomPadding;
   const rulerLength = Math.max(0, height - insets.top - insets.bottom);
-  const rulerAxisLength = isLandscape
-    ? Math.max(0, width - insets.left - insets.right)
-    : rulerLength;
   const rulerScrollRange = Math.max(rulerLength, DP_PER_CM * 24);
-  const rulerTrackLength = rulerAxisLength + rulerScrollRange;
-  const rulerPositiveOffsetLimit = Math.max(rulerAxisLength * 0.72, DP_PER_CM * 8);
-  const rulerHandleTravel = Math.max(
-    rulerAxisLength / 2 - (isLandscape ? RULER_HANDLE_WIDTH : RULER_HANDLE_HEIGHT),
-    0
-  );
+  const rulerTrackLength = rulerLength + rulerScrollRange;
+  const rulerPositiveOffsetLimit = Math.max(rulerLength * 0.72, DP_PER_CM * 8);
+  const rulerHandleTravel = Math.max(rulerLength / 2 - RULER_HANDLE_HEIGHT, 0);
   const rulerHandleTop = insets.top + rulerLength / 2 - RULER_HANDLE_HEIGHT / 2;
-  const rulerHandleLeft = insets.left + rulerAxisLength / 2 - RULER_HANDLE_WIDTH / 2;
-  const gaugeSize = isLandscape
-    ? clamp(Math.min(availableContentWidth * 0.38, availableContentHeight - 56), 120, 260)
-    : clamp(Math.min(availableContentWidth, Math.min(availableContentHeight * 0.4, height * 0.33)), 140, 360);
+  const gaugeSize = clamp(
+    Math.min(availableContentWidth, Math.min(availableContentHeight * 0.4, height * 0.33)),
+    140,
+    360
+  );
+  // Scale the compass to fit comfortably inside the gauge with breathing room around the bubble.
+  const compassRingDiameter = clamp(
+    gaugeSize - 28,
+    COMPASS_RING_MIN_DIAMETER,
+    COMPASS_RING_MAX_DIAMETER
+  );
+  const compassRingRadius = compassRingDiameter / 2;
+  const compassLabelOffset = -(compassRingRadius - COMPASS_LABEL_INSET);
+  const compassTickOffset = -(compassRingRadius - COMPASS_TICK_INSET);
+  const normalizedEdgeAngle = useMemo(() => {
+    if (reading?.mode !== 'edge') {
+      return null;
+    }
+
+    return normalizeSignedAngle(reading.rollAngle + edgeRotationTarget);
+  }, [edgeRotationTarget, reading?.mode, reading?.rollAngle]);
   const rollVisualAngle = useMemo(() => {
     if (!reading || reading.mode !== 'edge') {
       rollSnapRef.current = false;
       return null;
     }
 
-    const rawRollAngle = reading.rollAngle;
+    const rawRollAngle = normalizedEdgeAngle ?? reading.rollAngle;
     const snapThreshold = rollSnapRef.current ? ROLL_RELEASE_DEGREES : ROLL_SNAP_DEGREES;
 
     if (Math.abs(rawRollAngle) <= snapThreshold) {
@@ -664,7 +852,7 @@ export default function HomeScreen() {
 
     rollSnapRef.current = false;
     return rawRollAngle;
-  }, [reading]);
+  }, [normalizedEdgeAngle, reading]);
   const displayAngle = useMemo(() => {
     if (!reading) {
       zeroSnappedRef.current = false;
@@ -711,6 +899,16 @@ export default function HomeScreen() {
     () => mixColor('#FFFFFF', '#0A1302', Math.max(0, rollAlignmentIntensity - 0.15)),
     [rollAlignmentIntensity]
   );
+  const confidenceMeter = useMemo(() => confidenceTier(confidence), [confidence]);
+  const edgeRotationValue = useMemo(
+    () =>
+      edgeRotation.interpolate({
+        inputRange: [-1080, 1080],
+        outputRange: ['-1080deg', '1080deg'],
+      }),
+    [edgeRotation]
+  );
+  const edgeRotationStyle = reading?.mode === 'edge' ? { transform: [{ rotate: edgeRotationValue }] } : null;
   const primaryDisplay =
     displayAngle !== null
       ? formatPrimary(displayAngle, unit)
@@ -732,17 +930,35 @@ export default function HomeScreen() {
   }, [reading, unit]);
   const secondaryDisplay =
     displayAngle !== null
-      ? reading?.mode === 'flat' && flatDisplayAngles
-        ? formatFlatAxisSummary(flatDisplayAngles, unit)
-        : formatSecondary(displayAngle, supportingUnit)
+      ? formatSecondary(displayAngle, supportingUnit)
       : 'Waiting for motion data';
   const targetLabel = reading ? MODE_LABELS[reading.mode] : 'Starting';
-  const historyPageSize = isLandscape ? 4 : 3;
+  const historyPageSize = 3;
   const maxHistoryStart = Math.max(history.length - historyPageSize, 0);
   const visibleHistoryItems = history.slice(historyIndex, historyIndex + historyPageSize);
   const visibleHistoryEnd = Math.min(historyIndex + visibleHistoryItems.length, history.length);
   const canShowNewerHistory = historyIndex > 0;
   const canShowOlderHistory = visibleHistoryEnd < history.length;
+
+  /** Briefly flash the history button to signal a newly saved reading. */
+  function flashHistoryButton() {
+    historyButtonFlash.stopAnimation(() => {
+      historyButtonFlash.setValue(0);
+
+      Animated.sequence([
+        Animated.timing(historyButtonFlash, {
+          duration: 90,
+          toValue: 1,
+          useNativeDriver: true,
+        }),
+        Animated.timing(historyButtonFlash, {
+          duration: 360,
+          toValue: 0,
+          useNativeDriver: true,
+        }),
+      ]).start();
+    });
+  }
 
   /** Persist the shared ruler offset after a drag completes. */
   function commitRulerOffset(dragDelta: number) {
@@ -759,10 +975,9 @@ export default function HomeScreen() {
   const rightRulerPanResponder = useMemo(
     () =>
       PanResponder.create({
-        onMoveShouldSetPanResponder: (_, gesture) =>
-          isLandscape ? Math.abs(gesture.dx) > Math.abs(gesture.dy) : Math.abs(gesture.dy) > Math.abs(gesture.dx),
+        onMoveShouldSetPanResponder: (_, gesture) => Math.abs(gesture.dy) > Math.abs(gesture.dx),
         onPanResponderMove: (_, gesture) => {
-          const primaryDelta = isLandscape ? gesture.dx : gesture.dy;
+          const primaryDelta = gesture.dy;
           const nextOffset = clamp(
             rulerOffsetRef.current + primaryDelta,
             -rulerScrollRange,
@@ -775,7 +990,7 @@ export default function HomeScreen() {
           );
         },
         onPanResponderRelease: (_, gesture) => {
-          commitRulerOffset(isLandscape ? gesture.dx : gesture.dy);
+          commitRulerOffset(gesture.dy);
 
           Animated.spring(rulerHandleOffset, {
             damping: 20,
@@ -786,7 +1001,7 @@ export default function HomeScreen() {
           }).start();
         },
         onPanResponderTerminate: (_, gesture) => {
-          commitRulerOffset(isLandscape ? gesture.dx : gesture.dy);
+          commitRulerOffset(gesture.dy);
 
           Animated.spring(rulerHandleOffset, {
             damping: 20,
@@ -797,7 +1012,7 @@ export default function HomeScreen() {
           }).start();
         },
       }),
-    [isLandscape, rulerHandleOffset, rulerHandleTravel, rulerOffset, rulerPositiveOffsetLimit, rulerScrollRange]
+    [rulerHandleOffset, rulerHandleTravel, rulerOffset, rulerPositiveOffsetLimit, rulerScrollRange]
   );
 
   useEffect(() => {
@@ -805,28 +1020,6 @@ export default function HomeScreen() {
     rulerOffset.setValue(rulerOffsetRef.current);
     rulerHandleOffset.setValue(0);
   }, [rulerHandleOffset, rulerOffset, rulerPositiveOffsetLimit, rulerScrollRange]);
-
-  useEffect(() => {
-    let subscription: { remove: () => void } | null = null;
-    let mounted = true;
-
-    ScreenOrientation.getOrientationAsync()
-      .then((orientation) => {
-        if (mounted) {
-          setScreenOrientation(orientation);
-        }
-      })
-      .catch(() => undefined);
-
-    subscription = ScreenOrientation.addOrientationChangeListener((event) => {
-      setScreenOrientation(event.orientationInfo.orientation);
-    });
-
-    return () => {
-      mounted = false;
-      subscription?.remove();
-    };
-  }, []);
 
   useEffect(() => {
     let mounted = true;
@@ -890,7 +1083,6 @@ export default function HomeScreen() {
       const available = await DeviceMotion.isAvailableAsync();
 
       if (!available) {
-        setSensorStatus('No motion sensor available');
         return;
       }
 
@@ -908,7 +1100,6 @@ export default function HomeScreen() {
           !Number.isFinite(gravity.y) ||
           !Number.isFinite(gravity.z)
         ) {
-          setSensorStatus('Waiting for gravity data');
           return;
         }
 
@@ -916,17 +1107,87 @@ export default function HomeScreen() {
         const now = Date.now();
         const dt = lastSensorTimeRef.current !== null ? now - lastSensorTimeRef.current : SENSOR_INTERVAL_MS;
         lastSensorTimeRef.current = now;
+
+        const previousRaw = prevRawVectorRef.current;
+        const sampleDelta = previousRaw
+          ? Math.hypot(
+            nextVector.x - previousRaw.x,
+            nextVector.y - previousRaw.y,
+            nextVector.z - previousRaw.z
+          )
+          : 0;
+        prevRawVectorRef.current = nextVector;
+        jitterRef.current = jitterRef.current * (1 - CONFIDENCE_JITTER_ALPHA) + sampleDelta * CONFIDENCE_JITTER_ALPHA;
+
+        if (now - lastConfidenceUpdateRef.current >= CONFIDENCE_UPDATE_INTERVAL_MS) {
+          lastConfidenceUpdateRef.current = now;
+          setConfidence(clamp(1 - jitterRef.current / CONFIDENCE_JITTER_LIMIT, 0, 1));
+        }
+
         setVector((current) => mixVectors(current, nextVector, dt));
-        setSensorStatus('Live');
       });
     }
 
-    startDeviceMotion().catch(() => setSensorStatus('Sensor unavailable'));
+    startDeviceMotion().catch(() => undefined);
 
     return () => {
       mounted = false;
       subscription?.remove();
       lastSensorTimeRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    let subscription: { remove: () => void } | null = null;
+    let mounted = true;
+
+    /** Stream magnetometer samples and maintain a smoothed heading for the compass overlay. */
+    async function startMagnetometer() {
+      const available = await Magnetometer.isAvailableAsync();
+
+      if (!available || !mounted) {
+        return;
+      }
+
+      if (headingRef.current === null) {
+        headingRef.current = 0;
+        setHeading(0);
+      }
+
+      Magnetometer.setUpdateInterval(MAGNETOMETER_INTERVAL_MS);
+      subscription = Magnetometer.addListener((measurement: MagnetometerMeasurement) => {
+        if (
+          !Number.isFinite(measurement.x) ||
+          !Number.isFinite(measurement.y) ||
+          !Number.isFinite(measurement.z)
+        ) {
+          return;
+        }
+
+        const previous = magVectorRef.current;
+        const blended = previous
+          ? {
+            x: previous.x * (1 - HEADING_SMOOTH_ALPHA) + measurement.x * HEADING_SMOOTH_ALPHA,
+            y: previous.y * (1 - HEADING_SMOOTH_ALPHA) + measurement.y * HEADING_SMOOTH_ALPHA,
+            z: previous.z * (1 - HEADING_SMOOTH_ALPHA) + measurement.z * HEADING_SMOOTH_ALPHA,
+          }
+          : { x: measurement.x, y: measurement.y, z: measurement.z };
+        magVectorRef.current = blended;
+
+        const nextHeading = magnetometerHeading(blended.x, blended.y);
+        const smoothed = smoothHeading(headingRef.current, nextHeading, HEADING_SMOOTH_ALPHA);
+        headingRef.current = smoothed;
+        setHeading(smoothed);
+      });
+    }
+
+    startMagnetometer().catch(() => undefined);
+
+    return () => {
+      mounted = false;
+      subscription?.remove();
+      magVectorRef.current = null;
+      headingRef.current = null;
     };
   }, []);
 
@@ -957,7 +1218,11 @@ export default function HomeScreen() {
     }
 
     const stableReading = stableRef.current;
-    const stableAngle = roundDegreeDisplayAngle(reading.signedAngle);
+    const stableAngle = roundDegreeDisplayAngle(
+      reading.mode === 'edge' && normalizedEdgeAngle !== null
+        ? normalizedEdgeAngle
+        : reading.signedAngle
+    );
     const stableFlatAngles = reading.flatAngles
       ? {
         x: roundDegreeDisplayAngle(reading.flatAngles.x),
@@ -1008,12 +1273,35 @@ export default function HomeScreen() {
 
       setHistory((items) => [item, ...items].slice(0, MAX_HISTORY_ITEMS));
       setHistoryIndex(0);
+      flashHistoryButton();
     }
-  }, [capturePlayer, dingPlayer, isLevel, reading, soundEnabled]);
+  }, [capturePlayer, dingPlayer, isLevel, normalizedEdgeAngle, reading, soundEnabled]);
 
   useEffect(() => {
     setHistoryIndex((current) => clamp(current, 0, maxHistoryStart));
   }, [maxHistoryStart]);
+
+  useEffect(() => {
+    if (reading?.mode !== 'edge') {
+      setEdgeRotationTarget((current) => (current === 0 ? current : 0));
+      return;
+    }
+
+    setEdgeRotationTarget((current) => getEdgeRotationTarget(reading.rollAngle, current));
+  }, [reading?.mode, reading?.rollAngle]);
+
+  useEffect(() => {
+    edgeRotation.stopAnimation((currentValue) => {
+      const nextValue = getClosestRotationTarget(edgeRotationTarget, currentValue);
+
+      Animated.timing(edgeRotation, {
+        duration: EDGE_ROTATION_ANIMATION_MS,
+        easing: Easing.out(Easing.cubic),
+        toValue: nextValue,
+        useNativeDriver: true,
+      }).start();
+    });
+  }, [edgeRotation, edgeRotationTarget]);
 
   /** Clear the captured history and reset the modal paging position. */
   function clearHistory() {
@@ -1021,107 +1309,92 @@ export default function HomeScreen() {
     setHistoryIndex(0);
   }
 
-  /** Open the history modal and force portrait first when launched from landscape. */
-  async function openHistory() {
+  /** Open the history modal. */
+  function openHistory() {
     setHistoryIndex(0);
-
-    if (isLandscape) {
-      try {
-        await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP);
-      } catch {
-        // Fall back to opening the modal even if the orientation lock fails.
-      }
-    }
-
     setHistoryVisible(true);
   }
 
-  /** Close the history modal and restore the orientation behavior for the active mode. */
-  async function closeHistory() {
+  /** Close the history modal. */
+  function closeHistory() {
     setHistoryVisible(false);
-
-    try {
-      await applyOrientationLock(mode);
-    } catch {
-      // Ignore orientation unlock failures on dismiss.
-    }
   }
 
   /** Switch targets and clear any stale stability state from the previous mode. */
-  async function selectMode(nextMode: TargetMode) {
+  function selectMode(nextMode: TargetMode) {
     setMode(nextMode);
     stableRef.current = null;
     levelSinceRef.current = null;
     levelDingedRef.current = false;
-
-    try {
-      await applyOrientationLock(nextMode);
-      setLockStatus(nextMode === 'auto' ? 'Auto target' : `${MODES.find((item) => item.value === nextMode)?.label} locked`);
-    } catch {
-      setLockStatus('Target locked');
-    }
   }
 
   return (
     <SafeAreaView edges={['top', 'bottom', 'left', 'right']} style={styles.screen}>
-      {isLandscape ? (
-        <>
-          <SideRuler length={rulerTrackLength} offset={rulerOffset} placement="top" unit="in" />
-          <SideRuler length={rulerTrackLength} offset={rulerOffset} placement="bottom" unit="cm" />
-        </>
-      ) : (
-        <>
-          <SideRuler length={rulerTrackLength} offset={rulerOffset} placement="left" unit="in" />
-          <SideRuler length={rulerTrackLength} offset={rulerOffset} placement="right" unit="cm" />
-        </>
-      )}
+      <SideRuler length={rulerTrackLength} offset={rulerOffset} placement="left" unit="in" insets={insets} />
+      <SideRuler length={rulerTrackLength} offset={rulerOffset} placement="right" unit="cm" insets={insets} />
 
       <Animated.View
         style={[
           styles.rulerGrabHandle,
-          isLandscape ? styles.rulerGrabHandleLandscape : styles.rulerGrabHandlePortrait,
-          isLandscape
-            ? { left: rulerHandleLeft, transform: [{ translateX: rulerHandleOffset }] }
-            : { top: rulerHandleTop, transform: [{ translateY: rulerHandleOffset }] },
+          styles.rulerGrabHandlePortrait,
+          { top: rulerHandleTop, transform: [{ translateY: rulerHandleOffset }] },
         ]}
         {...rightRulerPanResponder.panHandlers}>
-        <MaterialCommunityIcons name={isLandscape ? 'drag-horizontal' : 'drag-vertical'} size={18} color="#000000" />
+        <MaterialCommunityIcons name="drag-vertical" size={18} color="#000000" />
       </Animated.View>
 
       <View
         style={[
           styles.content,
-          isLandscape && styles.contentLandscape,
           {
             paddingBottom: contentBottomPadding,
             paddingHorizontal: contentHorizontalPadding,
             paddingTop: contentTopPadding,
           },
         ]}>
-        <View style={[styles.header, isLandscape && styles.headerLandscape]}>
+        <View style={styles.header}>
           <View>
-            {!isLandscape && <Text style={styles.kicker}>Ultra Level</Text>}
-            <Text style={[styles.title, isLandscape && styles.titleLandscape]}>{targetLabel}</Text>
+            <Text style={styles.kicker}>Ultra Level</Text>
+            <Text style={styles.title}>{targetLabel}</Text>
           </View>
-          <View style={[styles.headerActions, isLandscape && styles.headerActionsLandscape]}>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel={history.length === 0 ? 'Open saved readings' : `Open ${history.length} saved readings`}
-              onPress={() => {
-                openHistory().catch(() => undefined);
-              }}
-              style={({ pressed }) => [
-                styles.iconButton,
-                isLandscape && styles.iconButtonLandscape,
-                pressed && styles.pressed,
-              ]}>
-              <MaterialCommunityIcons name="history" size={22} color="#FFFFFF" />
-              {history.length > 0 ? (
-                <View style={styles.historyBadge}>
-                  <Text style={styles.historyBadgeText}>{history.length > 99 ? '99+' : history.length}</Text>
-                </View>
-              ) : null}
-            </Pressable>
+          <View style={styles.headerActions}>
+            <View style={styles.historyButtonContainer}>
+              <Animated.View
+                pointerEvents="none"
+                style={[
+                  styles.historyButtonFlash,
+                  {
+                    opacity: historyButtonFlash.interpolate({
+                      inputRange: [0, 0.4, 1],
+                      outputRange: [0, 1, 0],
+                    }),
+                    transform: [
+                      {
+                        scale: historyButtonFlash.interpolate({
+                          inputRange: [0, 0.4, 1],
+                          outputRange: [0.9, 1.14, 1],
+                        }),
+                      },
+                    ],
+                  },
+                ]}
+              />
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={history.length === 0 ? 'Open saved readings' : `Open ${history.length} saved readings`}
+                onPress={openHistory}
+                style={({ pressed }) => [
+                  styles.iconButton,
+                  pressed && styles.pressed,
+                ]}>
+                <MaterialCommunityIcons name="history" size={22} color="#FFFFFF" />
+                {history.length > 0 ? (
+                  <View style={styles.historyBadge}>
+                    <Text style={styles.historyBadgeText}>{history.length > 99 ? '99+' : history.length}</Text>
+                  </View>
+                ) : null}
+              </Pressable>
+            </View>
 
             <Pressable
               accessibilityRole="button"
@@ -1129,7 +1402,6 @@ export default function HomeScreen() {
               onPress={() => setSoundEnabled((current) => !current)}
               style={({ pressed }) => [
                 styles.iconButton,
-                isLandscape && styles.iconButtonLandscape,
                 pressed && styles.pressed,
               ]}>
               <MaterialCommunityIcons
@@ -1141,11 +1413,12 @@ export default function HomeScreen() {
           </View>
         </View>
 
-        <View style={[styles.mainArea, isLandscape && styles.mainAreaLandscape]}>
+        <View style={styles.mainArea}>
           <View style={styles.gaugeColumn}>
-            <View
+            <Animated.View
               style={[
                 styles.gauge,
+                edgeRotationStyle,
                 {
                   backgroundColor: gaugeBackgroundColor,
                   borderColor: gaugeAccentColor,
@@ -1169,6 +1442,52 @@ export default function HomeScreen() {
                   <View style={[styles.crosshairVertical, { backgroundColor: gaugeAccentColor }]} />
                   <View style={[styles.crosshairHorizontal, { backgroundColor: gaugeAccentColor }]} />
                   <View style={[styles.centerRing, { borderColor: gaugeAccentColor }]} />
+                  {reading?.mode === 'flat' && heading !== null ? (
+                    <View
+                      style={[
+                        styles.compassRing,
+                        {
+                          borderColor: gaugeAccentColor,
+                          borderRadius: compassRingRadius,
+                          height: compassRingDiameter,
+                          width: compassRingDiameter,
+                          transform: [{ rotate: `${-heading}deg` }],
+                        },
+                      ]}>
+                      {COMPASS_TICKS.map((tick) => (
+                        <View
+                          key={tick.deg}
+                          style={[
+                            styles.compassTick,
+                            tick.cardinal ? styles.compassTickCardinal : null,
+                            { backgroundColor: gaugeAccentColor },
+                            {
+                              transform: [
+                                { rotate: `${tick.deg}deg` },
+                                { translateY: compassTickOffset },
+                              ],
+                            },
+                          ]}
+                        />
+                      ))}
+                      {COMPASS_LABELS.map((label) => (
+                        <Text
+                          key={label.text}
+                          style={[
+                            styles.compassLabel,
+                            { color: gaugeAccentColor },
+                            {
+                              transform: [
+                                { rotate: `${label.deg}deg` },
+                                { translateY: compassLabelOffset },
+                              ],
+                            },
+                          ]}>
+                          {label.text}
+                        </Text>
+                      ))}
+                    </View>
+                  ) : null}
                 </>
               )}
               <View
@@ -1184,21 +1503,54 @@ export default function HomeScreen() {
                   },
                 ]}
               />
-            </View>
+            </Animated.View>
           </View>
 
-          <View style={[styles.controlsColumn, isLandscape && styles.controlsColumnLandscape]}>
-            <View style={[styles.readout, isLandscape && styles.readoutLandscape]}>
-              <Text style={[styles.degreeText, isLandscape && styles.degreeTextLandscape]}>
-                {primaryDisplay}
-              </Text>
-              <Text style={styles.secondaryText}>{secondaryDisplay}</Text>
-              <Text style={styles.statusText}>
-                {isLevel ? 'Level' : lockStatus} · {sensorStatus}
-              </Text>
+          <View style={styles.controlsColumn}>
+            <View style={styles.readoutSlot}>
+              <Animated.View style={[styles.readout, edgeRotationStyle]}>
+                <Text style={styles.degreeText}>
+                  {primaryDisplay}
+                </Text>
+                {reading?.mode === 'flat' && flatDisplayAngles ? (
+                  <FlatAxisSummary flatAngles={flatDisplayAngles} unit={unit} variant="readout" />
+                ) : (
+                  <Text style={styles.secondaryText}>{secondaryDisplay}</Text>
+                )}
+                <View
+                  accessibilityLabel={`Sensor confidence ${confidenceMeter.label}`}
+                  accessibilityRole="progressbar"
+                  style={styles.confidenceRow}>
+                  <View style={styles.confidenceBars}>
+                    {[0, 1, 2].map((index) => {
+                      const lit = confidenceMeter.bars > index;
+
+                      return (
+                        <View
+                          key={index}
+                          style={[
+                            styles.confidenceBar,
+                            index === 0
+                              ? styles.confidenceBarSmall
+                              : index === 1
+                                ? styles.confidenceBarMedium
+                                : styles.confidenceBarLarge,
+                            lit
+                              ? { backgroundColor: confidenceMeter.color }
+                              : styles.confidenceBarEmpty,
+                          ]}
+                        />
+                      );
+                    })}
+                  </View>
+                  <Text style={[styles.confidenceText, { color: confidenceMeter.color }]}>
+                    {confidenceMeter.label} confidence
+                  </Text>
+                </View>
+              </Animated.View>
             </View>
 
-            <View style={[styles.segmentGroup, isLandscape && styles.segmentGroupLandscape]}>
+            <View style={styles.segmentGroup}>
               {UNITS.map((item) => (
                 <Pressable
                   accessibilityRole="button"
@@ -1206,7 +1558,6 @@ export default function HomeScreen() {
                   onPress={() => setUnit(item.value)}
                   style={({ pressed }) => [
                     styles.segment,
-                    isLandscape && styles.segmentLandscape,
                     unit === item.value && styles.segmentActive,
                     pressed && styles.pressed,
                   ]}>
@@ -1217,14 +1568,13 @@ export default function HomeScreen() {
               ))}
             </View>
 
-            <View style={[styles.modeGrid, isLandscape && styles.modeGridLandscape]}>
+            <View style={styles.modeGrid}>
               <Pressable
                 accessibilityRole="button"
                 onPress={() => selectMode('auto')}
                 style={({ pressed }) => [
                   styles.modeButton,
                   styles.modeButtonPrimary,
-                  isLandscape && styles.modeButtonLandscape,
                   mode === 'auto' && styles.modeButtonActive,
                   pressed && styles.pressed,
                 ]}>
@@ -1238,7 +1588,7 @@ export default function HomeScreen() {
                 </Text>
               </Pressable>
 
-              <View style={[styles.modeSecondaryRow, isLandscape && styles.modeSecondaryRowLandscape]}>
+              <View style={styles.modeSecondaryRow}>
                 {MODES.filter((item) => item.value !== 'auto').map((item) => (
                   <Pressable
                     accessibilityRole="button"
@@ -1247,7 +1597,6 @@ export default function HomeScreen() {
                     style={({ pressed }) => [
                       styles.modeButton,
                       styles.modeButtonSecondary,
-                      isLandscape && styles.modeButtonLandscape,
                       mode === item.value && styles.modeButtonActive,
                       pressed && styles.pressed,
                     ]}>
@@ -1267,22 +1616,18 @@ export default function HomeScreen() {
         </View>
       </View>
 
-      {!isLandscape && (
-        <Text
-          style={[
-            styles.dedicationText,
-            styles.dedicationTextBottom,
-            { bottom: Math.max(insets.bottom + 4, 10) },
-          ]}>
-          {'❤️ Nolan Tronowicz'}
-        </Text>
-      )}
+      <Text
+        style={[
+          styles.dedicationText,
+          styles.dedicationTextBottom,
+          { bottom: Math.max(insets.bottom + 4, 10) },
+        ]}>
+        {'❤️ Nolan Tronowicz'}
+      </Text>
 
       <Modal
         animationType="fade"
-        onRequestClose={() => {
-          closeHistory().catch(() => undefined);
-        }}
+        onRequestClose={closeHistory}
         statusBarTranslucent
         transparent
         visible={historyVisible}>
@@ -1290,12 +1635,10 @@ export default function HomeScreen() {
           <Pressable
             accessibilityRole="button"
             accessibilityLabel="Close saved readings"
-            onPress={() => {
-              closeHistory().catch(() => undefined);
-            }}
+            onPress={closeHistory}
             style={styles.historyModalBackdrop}
           />
-          <View style={[styles.historyModalCard, isLandscape && styles.historyModalCardLandscape]}>
+          <View style={styles.historyModalCard}>
             <View style={styles.historyModalHeader}>
               <View>
                 <Text style={styles.historyTitle}>Saved readings</Text>
@@ -1308,9 +1651,7 @@ export default function HomeScreen() {
               <Pressable
                 accessibilityRole="button"
                 accessibilityLabel="Close saved readings"
-                onPress={() => {
-                  closeHistory().catch(() => undefined);
-                }}
+                onPress={closeHistory}
                 style={({ pressed }) => [styles.modalCloseButton, pressed && styles.pressed]}>
                 <MaterialCommunityIcons name="close" size={20} color="#FFFFFF" />
               </Pressable>
@@ -1323,7 +1664,7 @@ export default function HomeScreen() {
 
             <View style={styles.historyModalBody}>
               {visibleHistoryItems.length > 0 ? (
-                <View style={[styles.historyCards, isLandscape && styles.historyCardsLandscape]}>
+                <View style={styles.historyCards}>
                   {visibleHistoryItems.map((item) => {
                     const historyFlatAngles = item.flatAngles
                       ? {
@@ -1331,15 +1672,16 @@ export default function HomeScreen() {
                         y: roundDisplayAngle(item.flatAngles.y, unit),
                       }
                       : null;
-                    const historySecondary =
-                      item.mode === 'flat' && historyFlatAngles
-                        ? formatFlatAxisSummary(historyFlatAngles, unit)
-                        : formatSecondary(item.angle, supportingUnit);
+                    const historySecondary = formatSecondary(item.angle, supportingUnit);
 
                     return (
-                      <View key={item.id} style={[styles.historyCard, isLandscape && styles.historyCardLandscape]}>
+                      <View key={item.id} style={styles.historyCard}>
                         <Text style={styles.historyCardValue}>{formatPrimary(item.angle, unit)}</Text>
-                        <Text style={styles.historyCardSecondary}>{historySecondary}</Text>
+                        {item.mode === 'flat' && historyFlatAngles ? (
+                          <FlatAxisSummary flatAngles={historyFlatAngles} unit={unit} variant="history" />
+                        ) : (
+                          <Text style={styles.historyCardSecondary}>{historySecondary}</Text>
+                        )}
                         <Text style={styles.historyCardMeta}>
                           {MODE_LABELS[item.mode]} · {item.time}
                         </Text>
@@ -1416,10 +1758,6 @@ const styles = StyleSheet.create({
     paddingBottom: 16,
     paddingTop: 12,
   },
-  contentLandscape: {
-    paddingBottom: 10,
-    paddingTop: 6,
-  },
   ruler: {
     backgroundColor: 'rgba(255, 255, 255, 0.04)',
     borderColor: 'rgba(255, 255, 255, 0.16)',
@@ -1432,23 +1770,6 @@ const styles = StyleSheet.create({
     bottom: 0,
     top: 0,
     width: RULER_WIDTH,
-  },
-  rulerHorizontal: {
-    height: RULER_WIDTH,
-    left: 0,
-    right: 0,
-  },
-  rulerLeft: {
-    left: 6,
-  },
-  rulerRight: {
-    right: 6,
-  },
-  rulerTop: {
-    top: 6,
-  },
-  rulerBottom: {
-    bottom: 6,
   },
   rulerEdge: {
     backgroundColor: '#FFFFFF',
@@ -1467,29 +1788,12 @@ const styles = StyleSheet.create({
     top: 0,
     width: 1,
   },
-  rulerEdgeTop: {
-    bottom: 0,
-    height: 1,
-    left: 0,
-    right: 0,
-  },
-  rulerEdgeBottom: {
-    height: 1,
-    left: 0,
-    right: 0,
-    top: 0,
-  },
   rulerTrack: {
     position: 'absolute',
   },
   rulerTrackVertical: {
     left: 0,
     right: 0,
-    top: 0,
-  },
-  rulerTrackHorizontal: {
-    bottom: 0,
-    left: 0,
     top: 0,
   },
   rulerTick: {
@@ -1499,20 +1803,11 @@ const styles = StyleSheet.create({
   rulerTickVertical: {
     height: 1,
   },
-  rulerTickHorizontal: {
-    width: 1,
-  },
   rulerTickLeft: {
     right: 0,
   },
   rulerTickRight: {
     left: 0,
-  },
-  rulerTickTop: {
-    bottom: 0,
-  },
-  rulerTickBottom: {
-    top: 0,
   },
   rulerTickShort: {
     width: 7,
@@ -1522,15 +1817,6 @@ const styles = StyleSheet.create({
   },
   rulerTickLong: {
     width: 18,
-  },
-  rulerTickShortHorizontal: {
-    height: 7,
-  },
-  rulerTickMediumHorizontal: {
-    height: 12,
-  },
-  rulerTickLongHorizontal: {
-    height: 18,
   },
   rulerLabel: {
     backgroundColor: '#07090B',
@@ -1554,14 +1840,6 @@ const styles = StyleSheet.create({
     right: 3,
     textAlign: 'right',
   },
-  rulerLabelTop: {
-    bottom: 6,
-    textAlign: 'center',
-  },
-  rulerLabelBottom: {
-    textAlign: 'center',
-    top: 6,
-  },
   rulerUnitBadge: {
     backgroundColor: '#FFFFFF',
     borderRadius: 8,
@@ -1576,14 +1854,6 @@ const styles = StyleSheet.create({
   rulerUnitBadgeRight: {
     bottom: 10,
     right: 4,
-  },
-  rulerUnitBadgeTop: {
-    right: 10,
-    top: 4,
-  },
-  rulerUnitBadgeBottom: {
-    bottom: 4,
-    right: 10,
   },
   rulerUnitText: {
     color: '#000000',
@@ -1603,37 +1873,31 @@ const styles = StyleSheet.create({
     right: 3,
     width: RULER_WIDTH + 6,
   },
-  rulerGrabHandleLandscape: {
-    borderRadius: 20,
-    bottom: 3,
-    height: RULER_WIDTH + 6,
-    width: RULER_HANDLE_WIDTH,
-  },
   header: {
     alignItems: 'center',
     flexDirection: 'row',
     justifyContent: 'space-between',
     marginBottom: 16,
   },
-  headerLandscape: {
-    marginBottom: 6,
-  },
   headerActions: {
     flexDirection: 'row',
     gap: 10,
   },
-  headerActionsLandscape: {
-    gap: 8,
+  historyButtonContainer: {
+    position: 'relative',
+  },
+  historyButtonFlash: {
+    backgroundColor: 'rgba(199, 255, 90, 0.22)',
+    borderRadius: 12,
+    bottom: -4,
+    left: -4,
+    position: 'absolute',
+    right: -4,
+    top: -4,
   },
   mainArea: {
     alignItems: 'center',
     flex: 1,
-    justifyContent: 'center',
-  },
-  mainAreaLandscape: {
-    alignItems: 'center',
-    flexDirection: 'row',
-    gap: 12,
     justifyContent: 'center',
   },
   gaugeColumn: {
@@ -1643,10 +1907,6 @@ const styles = StyleSheet.create({
   controlsColumn: {
     alignSelf: 'stretch',
     justifyContent: 'center',
-  },
-  controlsColumnLandscape: {
-    flex: 1,
-    maxWidth: 380,
   },
   kicker: {
     color: '#FFFFFF',
@@ -1659,9 +1919,6 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 32,
     fontWeight: '800',
-  },
-  titleLandscape: {
-    fontSize: 22,
   },
   dedicationText: {
     color: '#FFFFFF',
@@ -1684,10 +1941,6 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     position: 'relative',
     width: 44,
-  },
-  iconButtonLandscape: {
-    height: 34,
-    width: 34,
   },
   historyBadge: {
     alignItems: 'center',
@@ -1735,6 +1988,30 @@ const styles = StyleSheet.create({
     position: 'absolute',
     width: 84,
   },
+  compassRing: {
+    alignItems: 'center',
+    borderWidth: 1,
+    justifyContent: 'center',
+    opacity: 0.62,
+    position: 'absolute',
+  },
+  compassTick: {
+    height: 7,
+    opacity: 0.7,
+    position: 'absolute',
+    width: 1,
+  },
+  compassTickCardinal: {
+    height: 11,
+    opacity: 1,
+    width: 2,
+  },
+  compassLabel: {
+    fontSize: 15,
+    fontWeight: '900',
+    letterSpacing: 0.5,
+    position: 'absolute',
+  },
   rail: {
     opacity: 0.86,
     position: 'absolute',
@@ -1743,11 +2020,6 @@ const styles = StyleSheet.create({
     height: 3,
     left: 22,
     right: 22,
-  },
-  railVertical: {
-    bottom: 22,
-    top: 22,
-    width: 3,
   },
   railCenter: {
     borderRadius: 34,
@@ -1768,12 +2040,14 @@ const styles = StyleSheet.create({
     borderColor: '#0A1302',
     borderWidth: 8,
   },
+  readoutSlot: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 18,
+    minHeight: 210,
+  },
   readout: {
     alignItems: 'center',
-    marginTop: 18,
-  },
-  readoutLandscape: {
-    marginTop: 0,
   },
   degreeText: {
     color: '#FFFFFF',
@@ -1782,19 +2056,91 @@ const styles = StyleSheet.create({
     fontWeight: '900',
     includeFontPadding: false,
   },
-  degreeTextLandscape: {
-    fontSize: 46,
-  },
   secondaryText: {
     color: '#FFFFFF',
     fontSize: 20,
     fontWeight: '700',
   },
-  statusText: {
-    color: '#FFFFFF',
-    fontSize: 13,
+  flatAxisSummary: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  flatAxisSummaryReadout: {
+    justifyContent: 'center',
+    marginTop: 4,
+  },
+  flatAxisSummaryHistory: {
+    justifyContent: 'flex-start',
     marginTop: 6,
-    opacity: 0.72,
+  },
+  flatAxisRow: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.06)',
+    borderRadius: 999,
+    flexDirection: 'row',
+    gap: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  flatAxisRowHistory: {
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+  },
+  flatAxisIconBadge: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderRadius: 999,
+    height: 24,
+    justifyContent: 'center',
+    width: 24,
+  },
+  flatAxisIconBadgeHistory: {
+    height: 20,
+    width: 20,
+  },
+  flatAxisValue: {
+    color: '#FFFFFF',
+    fontSize: 18,
+    fontVariant: ['tabular-nums'],
+    fontWeight: '700',
+  },
+  flatAxisValueHistory: {
+    color: 'rgba(255, 255, 255, 0.88)',
+    fontSize: 14,
+  },
+  confidenceRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 10,
+  },
+  confidenceBars: {
+    alignItems: 'flex-end',
+    flexDirection: 'row',
+    gap: 3,
+    height: 14,
+  },
+  confidenceBar: {
+    borderRadius: 2,
+    width: 4,
+  },
+  confidenceBarSmall: {
+    height: 5,
+  },
+  confidenceBarMedium: {
+    height: 9,
+  },
+  confidenceBarLarge: {
+    height: 13,
+  },
+  confidenceBarEmpty: {
+    backgroundColor: 'rgba(255, 255, 255, 0.18)',
+  },
+  confidenceText: {
+    fontSize: 12,
+    fontWeight: '800',
+    letterSpacing: 0.2,
   },
   segmentGroup: {
     borderColor: '#FFFFFF',
@@ -1804,17 +2150,11 @@ const styles = StyleSheet.create({
     marginTop: 18,
     overflow: 'hidden',
   },
-  segmentGroupLandscape: {
-    marginTop: 10,
-  },
   segment: {
     alignItems: 'center',
     flex: 1,
     minHeight: 42,
     justifyContent: 'center',
-  },
-  segmentLandscape: {
-    minHeight: 34,
   },
   segmentActive: {
     backgroundColor: '#FFFFFF',
@@ -1831,16 +2171,9 @@ const styles = StyleSheet.create({
     gap: 8,
     marginTop: 12,
   },
-  modeGridLandscape: {
-    gap: 6,
-    marginTop: 8,
-  },
   modeSecondaryRow: {
     flexDirection: 'row',
     gap: 8,
-  },
-  modeSecondaryRowLandscape: {
-    gap: 6,
   },
   modeButton: {
     alignItems: 'center',
@@ -1857,9 +2190,6 @@ const styles = StyleSheet.create({
   },
   modeButtonSecondary: {
     flex: 1,
-  },
-  modeButtonLandscape: {
-    minHeight: 36,
   },
   modeButtonActive: {
     backgroundColor: '#FFFFFF',
@@ -1925,9 +2255,6 @@ const styles = StyleSheet.create({
     shadowRadius: 28,
     width: '100%',
   },
-  historyModalCardLandscape: {
-    maxWidth: 640,
-  },
   historyModalHeader: {
     alignItems: 'center',
     flexDirection: 'row',
@@ -1971,10 +2298,6 @@ const styles = StyleSheet.create({
   historyCards: {
     gap: 12,
   },
-  historyCardsLandscape: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-  },
   historyCard: {
     backgroundColor: '#101214',
     borderColor: 'rgba(255, 255, 255, 0.08)',
@@ -1983,9 +2306,6 @@ const styles = StyleSheet.create({
     minHeight: 74,
     paddingHorizontal: 16,
     paddingVertical: 16,
-  },
-  historyCardLandscape: {
-    width: '48.5%',
   },
   historyCardValue: {
     color: '#FFFFFF',
